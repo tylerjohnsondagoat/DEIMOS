@@ -27,7 +27,7 @@ logger = logging.getLogger("deimos")
 # Config
 # ---------------------------------------------------------------------------
 CONFIRM_THRESHOLD = 3       # Total votes needed (initiator + 2 confirmers)
-KILL_WINDOW_SECONDS = 60    # How long confirmers have to vote
+KILL_WINDOW_SECONDS = 240   # How long confirmers have to vote (4 min)
 PURGE_MINUTES = 15          # Delete target's messages from last N minutes
 MUTE_DAYS = 14              # Discord timeout duration
 COOLDOWN_SECONDS = 300      # 5 min cooldown per initiator
@@ -44,6 +44,18 @@ DEV_USER_IDS: set[int] = {
 # See execute_kill() where FORWARD_MODE is read.
 FORWARD_MODE = "first"
 MAX_FORWARDED_MESSAGES = 20  # Hard cap when FORWARD_MODE = "all" to avoid flooding modchat
+
+
+def defang_mentions(text: str) -> str:
+    """Neutralize mass-ping tokens so forwarding spambot content into modchat can't ping the room.
+
+    Wraps @everyone / @here in backticks (Discord renders them as inline code, which never pings).
+    Belt-and-suspenders only: every modchat.send() that carries this also passes
+    allowed_mentions=discord.AllowedMentions.none(), so even a missed token can't notify.
+    """
+    if not text:
+        return text
+    return text.replace("@everyone", "`@everyone`").replace("@here", "`@here`")
 
 # ---------------------------------------------------------------------------
 # Bot setup
@@ -364,7 +376,7 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
                         f"(earliest of {len(ordered)} message{'s' if len(ordered) != 1 else ''}):"
                     )
 
-                await modchat.send(header)
+                await modchat.send(header, allowed_mentions=discord.AllowedMentions.none())
                 for msg in to_forward:
                     forwarded = False
                     try:
@@ -373,14 +385,17 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
                     except (AttributeError, discord.HTTPException, discord.Forbidden):
                         pass
                     if not forwarded:
-                        # Fallback: quote the content manually
-                        content = msg.content or "[no text]"
+                        # Fallback: quote the content manually. This is the real ping risk:
+                        # the spambot's raw text lands in a normal message, so an @everyone in
+                        # it would ping all of modchat. defang_mentions() backticks it; the
+                        # allowed_mentions=none() below is the hard guarantee nothing pings.
+                        content = defang_mentions(msg.content or "[no text]")
                         attachments = " ".join(a.url for a in msg.attachments)
                         body = f"> From {msg.channel.mention}:\n> {content[:1800]}"
                         if attachments:
                             body += f"\n{attachments}"
                         try:
-                            await modchat.send(body)
+                            await modchat.send(body, allowed_mentions=discord.AllowedMentions.none())
                         except discord.HTTPException:
                             pass
                 if FORWARD_MODE == "all" and len(ordered) > MAX_FORWARDED_MESSAGES:
@@ -490,7 +505,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "1. Spot a spambot? Use `/kill @user` to flag them.\n"
             "2. A **Kill Vote** appears with a confirmation button.\n"
-            "3. **2 other server members** must confirm within 60 seconds.\n"
+            "3. **2 other server members** must confirm within 4 minutes.\n"
             "4. If confirmed: the target is **muted for 14 days** and their "
             "messages from the last 15 minutes are **purged**."
         ),
