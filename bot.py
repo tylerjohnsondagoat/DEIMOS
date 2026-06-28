@@ -850,10 +850,10 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="Auto-Trap",
         value=(
-            f"DEIMOS auto-mutes anyone who carpet-bombs **{TRAP_CHANNELS}+ channels in "
-            f"{TRAP_WINDOW_SECONDS} seconds** (a rate no human can hit). Their messages are "
-            "purged and a report with **Approve / Unmute** buttons is sent to the mod channel. "
-            "Mods, admins, and bots are never trapped."
+            "DEIMOS automatically detects and freezes mass cross-channel spam (the kind of "
+            "rapid-fire posting only a bot does). Offenders are muted and their messages purged, "
+            "with a report sent to the mod channel for review. Mods, admins, and bots are never "
+            "affected, and any mistake is one click to undo."
         ),
         inline=False,
     )
