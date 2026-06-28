@@ -7,6 +7,7 @@ import os
 import json
 import asyncio
 import logging
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -45,6 +46,17 @@ DEV_USER_IDS: set[int] = {
 FORWARD_MODE = "first"
 MAX_FORWARDED_MESSAGES = 20  # Hard cap when FORWARD_MODE = "all" to avoid flooding modchat
 
+# --- Auto-trap: hard-rate carpet-bomb detection -----------------------------
+# A user who posts into TRAP_CHANNELS distinct channels within TRAP_WINDOW_SECONDS
+# is auto-muted + purged (no human can hit 5 different channels in 12s). Counts
+# threads and voice-channel text chats, not just top-level text channels.
+TRAP_CHANNELS = 5
+TRAP_WINDOW_SECONDS = 12
+# Armed by default. Set DEIMOS_AUTOTRAP_ENABLED=0 in Railway env to disable instantly.
+AUTOTRAP_ENABLED = os.environ.get("DEIMOS_AUTOTRAP_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+
 
 def defang_mentions(text: str) -> str:
     """Neutralize mass-ping tokens so forwarding spambot content into modchat can't ping the room.
@@ -68,9 +80,33 @@ intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # In-memory state
-pending_kills: dict[int, dict] = {}   # message_id -> kill data
+# A "kill" is now logical: one (guild, target) vote that can span multiple channels.
+# Its kill_id is the message_id of its FIRST panel (also the DEIMOS_kills DB row key).
+pending_kills: dict[int, dict] = {}   # kill_id -> kill data
+panel_index: dict[int, int] = {}      # any panel message_id -> kill_id (reverse lookup for button clicks)
 cooldowns: dict[int, datetime] = {}   # user_id -> last kill time
-processed_kills: set[int] = set()     # message_ids already confirmed (dedup)
+processed_kills: set[int] = set()     # kill_ids already resolved (dedup)
+
+# Auto-trap state
+spam_windows: dict[int, deque] = {}   # user_id -> deque[(created_at, channel_id)]
+trapped_users: set[int] = set()       # user_ids already auto-trapped (debounce)
+
+
+def iter_message_channels(guild: discord.Guild):
+    """Every channel that can hold messages: text channels, voice-channel text
+    chats, and threads (active). Used for both /kill purges and auto-trap purges."""
+    seen: set[int] = set()
+    for ch in guild.text_channels:
+        seen.add(ch.id)
+        yield ch
+    for ch in guild.voice_channels:  # VoiceChannel supports .history() for text-in-voice
+        if ch.id not in seen:
+            seen.add(ch.id)
+            yield ch
+    for th in guild.threads:         # active threads (includes forum posts)
+        if th.id not in seen:
+            seen.add(th.id)
+            yield th
 
 # ---------------------------------------------------------------------------
 # Database
@@ -187,26 +223,58 @@ async def get_leaderboard(guild_id, limit=10):
 
 
 # ---------------------------------------------------------------------------
-# Confirm button
+# Vote panel: embed + button (shared by every channel a kill spans)
 # ---------------------------------------------------------------------------
 
+def build_vote_embed(kill_data: dict) -> discord.Embed:
+    """Build the live KILL VOTE embed at the kill's current vote count."""
+    total = 1 + len(kill_data["confirmers"])  # initiator + confirmers
+    remaining = max(0, CONFIRM_THRESHOLD - total)
+    embed = discord.Embed(
+        title="KILL VOTE",
+        description=f"**Target:** <@{kill_data['target_id']}>\n"
+                    f"**Flagged by:** <@{kill_data['initiator_id']}>\n\n"
+                    f"**{remaining} more confirmation{'s' if remaining != 1 else ''} needed** "
+                    f"within {KILL_WINDOW_SECONDS}s.\n\n"
+                    f"Votes count from **any channel**: use `/kill` on the same user "
+                    f"or press the button below.\n\n"
+                    f"If confirmed: **{MUTE_DAYS}-day mute** + purge last {PURGE_MINUTES} min of messages.",
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text=f"Expires in {KILL_WINDOW_SECONDS}s")
+    return embed
+
+
+async def refresh_all_panels(kill_data: dict):
+    """Re-render every channel panel for this kill at the current vote count."""
+    embed = build_vote_embed(kill_data)
+    count = len(kill_data["confirmers"])
+    for panel in kill_data["panels"]:
+        try:
+            msg = await panel["channel"].fetch_message(panel["message_id"])
+            await msg.edit(embed=embed, view=ConfirmKillView(count))
+        except Exception:
+            logger.debug("Could not refresh panel %s", panel["message_id"])
+
+
 class ConfirmKillButton(discord.ui.Button):
-    def __init__(self):
+    def __init__(self, confirmer_count: int = 0):
         super().__init__(
             style=discord.ButtonStyle.danger,
-            label="Confirm Kill (0/2)",
+            label=f"Confirm Kill ({confirmer_count}/{CONFIRM_THRESHOLD - 1})",
             custom_id="deimos_confirm",
         )
 
     async def callback(self, interaction: discord.Interaction):
-        msg_id = interaction.message.id
-        kill_data = pending_kills.get(msg_id)
+        kill_id = panel_index.get(interaction.message.id)
+        kill_data = pending_kills.get(kill_id) if kill_id is not None else None
 
         if not kill_data:
             await interaction.response.send_message("This kill has already expired or been resolved.", ephemeral=True)
             return
 
-        if msg_id in processed_kills:
+        if kill_id in processed_kills:
             await interaction.response.send_message("This kill has already been confirmed.", ephemeral=True)
             return
 
@@ -234,24 +302,23 @@ class ConfirmKillButton(discord.ui.Button):
         kill_data["confirmers"].add(user_id)
         kill_data["confirmer_names"][user_id] = interaction.user.display_name
         total = 1 + len(kill_data["confirmers"])  # initiator + confirmers
-        needed = CONFIRM_THRESHOLD - total
 
-        if needed > 0:
-            # Update button label
-            self.label = f"Confirm Kill ({len(kill_data['confirmers'])}/{CONFIRM_THRESHOLD - 1})"
-            await interaction.response.edit_message(view=self.view)
+        if total < CONFIRM_THRESHOLD:
+            # Sync every channel's panel to the new count.
+            await interaction.response.defer()
+            await refresh_all_panels(kill_data)
             return
 
         # --- THRESHOLD MET: EXECUTE KILL ---
-        processed_kills.add(msg_id)
+        processed_kills.add(kill_id)
         await interaction.response.defer()
         await execute_kill(interaction, kill_data)
 
 
 class ConfirmKillView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, confirmer_count: int = 0):
         super().__init__(timeout=None)
-        self.add_item(ConfirmKillButton())
+        self.add_item(ConfirmKillButton(confirmer_count))
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +358,7 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
 
         # Collect messages from last 15 minutes BEFORE deleting them
         cutoff = discord.utils.utcnow() - timedelta(minutes=PURGE_MINUTES)
-        for channel in guild.text_channels:
+        for channel in iter_message_channels(guild):
             try:
                 async for msg in channel.history(limit=100, after=cutoff):
                     if msg.author.id == target_id:
@@ -307,7 +374,7 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
             except (discord.Forbidden, discord.HTTPException, discord.NotFound):
                 continue
 
-    # Update DB
+    # Update DB (DB row is keyed on the kill's first panel = its kill_id)
     await confirm_kill(msg_id, all_participants)
 
     # Award scores
@@ -315,10 +382,12 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
         name = all_names.get(uid, "Unknown")
         await add_score(guild.id, uid, name, correct=1, false_pos=0)
 
-    # Remove from pending
+    # Remove from pending + clear panel lookups
     pending_kills.pop(msg_id, None)
+    for panel in kill_data["panels"]:
+        panel_index.pop(panel["message_id"], None)
 
-    # Update the embed
+    # Update every channel's panel
     confirmer_mentions = " ".join(f"<@{uid}>" for uid in kill_data["confirmers"])
     result_embed = discord.Embed(
         title="KILL CONFIRMED",
@@ -332,10 +401,12 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
     )
     result_embed.set_footer(text="Use /unkill to reverse if this was a mistake")
 
-    try:
-        await interaction.message.edit(embed=result_embed, view=None)
-    except Exception:
-        logger.error("Failed to edit kill message", exc_info=True)
+    for panel in kill_data["panels"]:
+        try:
+            msg = await panel["channel"].fetch_message(panel["message_id"])
+            await msg.edit(embed=result_embed, view=None)
+        except Exception:
+            logger.debug("Failed to edit kill panel %s", panel["message_id"])
 
     # Post report to modchat
     try:
@@ -408,6 +479,214 @@ async def execute_kill(interaction: discord.Interaction, kill_data: dict):
 
 
 # ---------------------------------------------------------------------------
+# Auto-trap: hard-rate carpet-bomb detection
+# ---------------------------------------------------------------------------
+
+class TrapApproveButton(discord.ui.Button):
+    def __init__(self, target_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="Approve (confirm spam)",
+            custom_id=f"deimos_trap_approve:{target_id}",
+        )
+        self.target_id = target_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message("Moderators only.", ephemeral=True)
+            return
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.dark_red()
+        embed.add_field(
+            name="Reviewed",
+            value=(
+                f"Confirmed as spam by {interaction.user.mention}.\n"
+                f"**Reminder: the auto-trap only MUTED + purged. You still need to "
+                f"BAN <@{self.target_id}> to remove them for good.**"
+            ),
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class TrapUnmuteButton(discord.ui.Button):
+    def __init__(self, target_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="Unmute (false positive)",
+            custom_id=f"deimos_trap_unmute:{target_id}",
+        )
+        self.target_id = target_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message("Moderators only.", ephemeral=True)
+            return
+        guild = interaction.guild
+        # Remove the timeout
+        try:
+            member = guild.get_member(self.target_id) or await guild.fetch_member(self.target_id)
+            await member.timeout(None, reason=f"DEIMOS Auto-Trap reversed by {interaction.user.display_name}")
+        except Exception:
+            logger.debug("Auto-trap unmute: could not clear timeout on %s", self.target_id)
+        # Mark the trap as a false positive and let the user be re-evaluated
+        await mark_false_positive(guild.id, self.target_id)
+        trapped_users.discard(self.target_id)
+
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.green()
+        embed.add_field(
+            name="Reviewed",
+            value=f"Reversed by {interaction.user.mention} (false positive). User unmuted.",
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class TrapReviewView(discord.ui.View):
+    def __init__(self, target_id: int):
+        super().__init__(timeout=None)
+        self.add_item(TrapApproveButton(target_id))
+        self.add_item(TrapUnmuteButton(target_id))
+
+
+async def trap_spammer(guild: discord.Guild, member: discord.Member, channel_ids: set[int]):
+    """Auto-mute + purge a carpet-bomber, then post a mod-review report with buttons."""
+    target_id = member.id
+
+    # 1. Mute (14-day timeout)
+    muted = False
+    try:
+        until = discord.utils.utcnow() + timedelta(days=MUTE_DAYS)
+        await member.timeout(until, reason=f"DEIMOS Auto-Trap: carpet-bomb across {len(channel_ids)} channels")
+        muted = True
+    except discord.Forbidden:
+        logger.warning("Auto-trap cannot timeout %s - insufficient permissions", target_id)
+    except Exception:
+        logger.error("Auto-trap failed to timeout %s", target_id, exc_info=True)
+
+    # 2. Collect + purge their last 15 min across every message-bearing channel
+    collected: list[discord.Message] = []
+    cutoff = discord.utils.utcnow() - timedelta(minutes=PURGE_MINUTES)
+    for ch in iter_message_channels(guild):
+        try:
+            async for msg in ch.history(limit=100, after=cutoff):
+                if msg.author.id == target_id:
+                    collected.append(msg)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    purged = 0
+    for msg in collected:
+        try:
+            await msg.delete()
+            purged += 1
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            continue
+
+    logger.info("[guild:%s] AUTO-TRAP on %s (%s): %d channels, muted=%s, purged=%d",
+                guild.id, target_id, member.display_name, len(channel_ids), muted, purged)
+
+    # 3. Mod-review report to modchat with Approve / Unmute buttons
+    modchat = bot.get_channel(MODCHAT_CHANNEL_ID)
+    if not modchat:
+        logger.error("Auto-trap: modchat channel %s not found; trap applied without report", MODCHAT_CHANNEL_ID)
+        return
+
+    channel_mentions = " ".join(f"<#{cid}>" for cid in channel_ids)
+    report = discord.Embed(
+        title="AUTO-TRAP: Carpet-bomb detected",
+        description=(
+            f"**Target:** {member.mention} (`{target_id}`)\n"
+            f"**Pattern:** {len(channel_ids)} channels within {TRAP_WINDOW_SECONDS}s "
+            f"(faster than any human)\n"
+            f"**Channels:** {channel_mentions}\n\n"
+            f"**Muted:** {'14 days' if muted else 'FAILED (check perms)'}\n"
+            f"**Messages purged:** {purged}\n\n"
+            f"Review below. **Approve** confirms spam (you must still ban them); "
+            f"**Unmute** reverses a false positive."
+        ),
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    try:
+        report_msg = await modchat.send(embed=report, view=TrapReviewView(target_id))
+    except Exception:
+        logger.error("Auto-trap: failed to post mod report", exc_info=True)
+        return
+
+    # Record in DB as a confirmed auto-trap (keyed on the report message)
+    try:
+        await insert_kill(guild.id, target_id, member.display_name,
+                          bot.user.id, "DEIMOS Auto-Trap", report_msg.id, MODCHAT_CHANNEL_ID)
+        await confirm_kill(report_msg.id, [bot.user.id])
+    except Exception:
+        logger.error("Auto-trap: failed to record kill row", exc_info=True)
+
+    # Forward the earliest flagged message for context
+    if collected:
+        ordered = sorted(collected, key=lambda m: m.created_at)
+        await modchat.send(
+            f"**Flagged content from <@{target_id}>** (earliest of {len(ordered)} message"
+            f"{'s' if len(ordered) != 1 else ''}):",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        first = ordered[0]
+        forwarded = False
+        try:
+            await first.forward(modchat)
+            forwarded = True
+        except (AttributeError, discord.HTTPException, discord.Forbidden):
+            pass
+        if not forwarded:
+            content = defang_mentions(first.content or "[no text]")
+            attachments = " ".join(a.url for a in first.attachments)
+            body = f"> From {first.channel.mention}:\n> {content[:1800]}"
+            if attachments:
+                body += f"\n{attachments}"
+            try:
+                await modchat.send(body, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if not AUTOTRAP_ENABLED:
+        return
+    if message.guild is None:
+        return
+
+    author = message.author
+    if author.bot or message.webhook_id is not None:
+        return
+    if author.id in trapped_users:
+        return
+
+    # Exempt mods/admins (the only humans who might run a legit cross-poster)
+    perms = getattr(author, "guild_permissions", None)
+    if perms and (perms.manage_messages or perms.administrator):
+        return
+
+    uid = author.id
+    now = message.created_at  # tz-aware UTC, creation time
+    dq = spam_windows.setdefault(uid, deque())
+    dq.append((now, message.channel.id))
+
+    cutoff = now - timedelta(seconds=TRAP_WINDOW_SECONDS)
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+    distinct = {cid for _, cid in dq}
+    if len(distinct) >= TRAP_CHANNELS:
+        trapped_users.add(uid)
+        spam_windows.pop(uid, None)
+        try:
+            await trap_spammer(message.guild, author, distinct)
+        except Exception:
+            logger.error("Auto-trap handler failed for %s", uid, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 
@@ -430,15 +709,15 @@ async def kill_command(interaction: discord.Interaction, target: discord.Member)
         await interaction.response.send_message("Can't kill moderators or admins.", ephemeral=True)
         return
 
-    # Check for active kill on same target
+    # Already an active kill on this (guild, target)? Join it instead of starting a new one.
     for kill_data in pending_kills.values():
         if kill_data["target_id"] == target.id and kill_data["guild_id"] == guild.id:
-            await interaction.response.send_message(
-                f"There's already an active kill vote on {target.mention}.", ephemeral=True
-            )
+            await join_existing_kill(interaction, kill_data, user)
             return
 
-    # Cooldown check
+    # --- NEW KILL ---
+
+    # Cooldown check (only gates STARTING a kill; joining an existing one is free)
     last_kill = cooldowns.get(user.id)
     if last_kill:
         elapsed = (datetime.now(timezone.utc) - last_kill).total_seconds()
@@ -451,24 +730,7 @@ async def kill_command(interaction: discord.Interaction, target: discord.Member)
 
     cooldowns[user.id] = datetime.now(timezone.utc)
 
-    # Build kill embed
-    embed = discord.Embed(
-        title="KILL VOTE",
-        description=f"**Target:** {target.mention}\n"
-                    f"**Flagged by:** {user.mention}\n\n"
-                    f"**{CONFIRM_THRESHOLD - 1} more confirmations needed** within {KILL_WINDOW_SECONDS}s.\n\n"
-                    f"If confirmed: **{MUTE_DAYS}-day mute** + purge last {PURGE_MINUTES} min of messages.",
-        color=discord.Color.orange(),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.set_footer(text=f"Expires in {KILL_WINDOW_SECONDS}s")
-
-    view = ConfirmKillView()
-    await interaction.response.send_message(embed=embed, view=view)
-    msg = await interaction.original_response()
-
-    # Store pending kill
-    pending_kills[msg.id] = {
+    kill_data = {
         "guild_id": guild.id,
         "target_id": target.id,
         "target_name": target.display_name,
@@ -476,11 +738,19 @@ async def kill_command(interaction: discord.Interaction, target: discord.Member)
         "initiator_name": user.display_name,
         "confirmers": set(),
         "confirmer_names": {},
-        "message_id": msg.id,
-        "channel_id": interaction.channel_id,
+        "message_id": None,   # set after send; doubles as kill_id + DB row key
+        "panels": [],         # [{"channel": ch, "message_id": mid}, ...]
         "expires_at": datetime.now(timezone.utc) + timedelta(seconds=KILL_WINDOW_SECONDS),
-        "interaction_channel": interaction.channel,
     }
+
+    embed = build_vote_embed(kill_data)
+    await interaction.response.send_message(embed=embed, view=ConfirmKillView(0))
+    msg = await interaction.original_response()
+
+    kill_data["message_id"] = msg.id
+    kill_data["panels"].append({"channel": interaction.channel, "message_id": msg.id})
+    pending_kills[msg.id] = kill_data
+    panel_index[msg.id] = msg.id
 
     # Insert into DB
     await insert_kill(guild.id, target.id, target.display_name,
@@ -488,6 +758,41 @@ async def kill_command(interaction: discord.Interaction, target: discord.Member)
 
     logger.info("[guild:%s] Kill vote started on %s (%s) by %s (%s)",
                 guild.id, target.id, target.display_name, user.id, user.display_name)
+
+
+async def join_existing_kill(interaction: discord.Interaction, kill_data: dict, user: discord.Member):
+    """A /kill on a target that already has a live vote: count the invoker's vote (if new)
+    and make sure this channel has a live panel."""
+    user_id = user.id
+    kill_id = kill_data["message_id"]
+    already_voted = user_id == kill_data["initiator_id"] or user_id in kill_data["confirmers"]
+    has_panel_here = any(p["channel"].id == interaction.channel_id for p in kill_data["panels"])
+
+    # Count this /kill as a confirmation vote (max flexibility: every /kill is a vote).
+    if not already_voted:
+        kill_data["confirmers"].add(user_id)
+        kill_data["confirmer_names"][user_id] = user.display_name
+
+    total = 1 + len(kill_data["confirmers"])
+
+    if not has_panel_here:
+        # Surface a live panel in this channel.
+        embed = build_vote_embed(kill_data)
+        await interaction.response.send_message(embed=embed, view=ConfirmKillView(len(kill_data["confirmers"])))
+        new_msg = await interaction.original_response()
+        kill_data["panels"].append({"channel": interaction.channel, "message_id": new_msg.id})
+        panel_index[new_msg.id] = kill_id
+    else:
+        note = "You've already voted on this kill." if already_voted else "Your vote was added."
+        await interaction.response.send_message(
+            f"{note} The live vote is posted in this channel.", ephemeral=True
+        )
+
+    if total >= CONFIRM_THRESHOLD and kill_id not in processed_kills:
+        processed_kills.add(kill_id)
+        await execute_kill(interaction, kill_data)
+    else:
+        await refresh_all_panels(kill_data)
 
 
 @bot.tree.command(name="deimos", description="How DEIMOS works - Enforcer guide")
@@ -505,7 +810,10 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "1. Spot a spambot? Use `/kill @user` to flag them.\n"
             "2. A **Kill Vote** appears with a confirmation button.\n"
-            "3. **2 other server members** must confirm within 4 minutes.\n"
+            "3. **2 other server members** must confirm within 4 minutes. "
+            "Votes count from **any channel**: pressing the button OR running "
+            "`/kill` on the same user both add a vote, so you don't have to "
+            "round everyone into one channel.\n"
             "4. If confirmed: the target is **muted for 14 days** and their "
             "messages from the last 15 minutes are **purged**."
         ),
@@ -536,6 +844,16 @@ async def help_command(interaction: discord.Interaction):
             "When a kill passes, the target's flagged message is **forwarded to a moderator-only "
             "channel** for review before it gets purged. Mods can confirm legit kills, ban true "
             "spambots, or reverse false positives."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Auto-Trap",
+        value=(
+            f"DEIMOS auto-mutes anyone who carpet-bombs **{TRAP_CHANNELS}+ channels in "
+            f"{TRAP_WINDOW_SECONDS} seconds** (a rate no human can hit). Their messages are "
+            "purged and a report with **Approve / Unmute** buttons is sent to the mod channel. "
+            "Mods, admins, and bots are never trapped."
         ),
         inline=False,
     )
@@ -752,7 +1070,9 @@ async def pulse_command(interaction: discord.Interaction):
             f"**Latency:** {round(bot.latency * 1000)}ms\n"
             f"**Database:** {'Connected' if db_ok else 'DOWN'}\n"
             f"**Pending kills:** {pending}\n"
-            f"**Processed (session):** {processed}"
+            f"**Processed (session):** {processed}\n"
+            f"**Auto-trap:** {'ARMED' if AUTOTRAP_ENABLED else 'OFF'} "
+            f"({TRAP_CHANNELS} ch / {TRAP_WINDOW_SECONDS}s, {len(trapped_users)} trapped)"
         ),
         color=discord.Color.green() if db_ok else discord.Color.red(),
         timestamp=discord.utils.utcnow(),
@@ -823,7 +1143,7 @@ async def scan_command(interaction: discord.Interaction, target: discord.Member)
     cutoff = discord.utils.utcnow() - timedelta(minutes=PURGE_MINUTES)
     found = []
 
-    for channel in interaction.guild.text_channels:
+    for channel in iter_message_channels(interaction.guild):
         try:
             async for msg in channel.history(limit=100, after=cutoff):
                 if msg.author.id == target.id:
@@ -889,35 +1209,35 @@ async def expire_pending_kills():
     now = datetime.now(timezone.utc)
     expired = []
 
-    for msg_id, kill_data in list(pending_kills.items()):
-        if msg_id in processed_kills:
+    for kill_id, kill_data in list(pending_kills.items()):
+        if kill_id in processed_kills:
             continue
         if now >= kill_data["expires_at"]:
-            expired.append(msg_id)
+            expired.append(kill_id)
 
-    for msg_id in expired:
-        kill_data = pending_kills.pop(msg_id, None)
+    for kill_id in expired:
+        kill_data = pending_kills.pop(kill_id, None)
         if not kill_data:
             continue
 
-        processed_kills.add(msg_id)
-        await expire_kill(msg_id)
+        processed_kills.add(kill_id)
+        await expire_kill(kill_id)
 
-        # Edit the embed to show expired
-        try:
-            channel = kill_data.get("interaction_channel")
-            if channel:
-                msg = await channel.fetch_message(msg_id)
-                embed = discord.Embed(
-                    title="KILL EXPIRED",
-                    description=f"**Target:** <@{kill_data['target_id']}>\n"
-                                f"Not enough confirmations within {KILL_WINDOW_SECONDS}s.",
-                    color=discord.Color.dark_grey(),
-                    timestamp=discord.utils.utcnow(),
-                )
+        # Edit every channel's panel to show expired, then drop its lookup
+        embed = discord.Embed(
+            title="KILL EXPIRED",
+            description=f"**Target:** <@{kill_data['target_id']}>\n"
+                        f"Not enough confirmations within {KILL_WINDOW_SECONDS}s.",
+            color=discord.Color.dark_grey(),
+            timestamp=discord.utils.utcnow(),
+        )
+        for panel in kill_data["panels"]:
+            try:
+                msg = await panel["channel"].fetch_message(panel["message_id"])
                 await msg.edit(embed=embed, view=None)
-        except Exception:
-            logger.debug("Could not edit expired kill message %s", msg_id)
+            except Exception:
+                logger.debug("Could not edit expired kill panel %s", panel["message_id"])
+            panel_index.pop(panel["message_id"], None)
 
         logger.info("[guild:%s] Kill vote expired for %s", kill_data["guild_id"], kill_data["target_id"])
 
