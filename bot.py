@@ -76,9 +76,9 @@ def defang_mentions(text: str) -> str:
 # Bot setup
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.presences = True
+intents.message_content = True  # Privileged: forwards spam text to mods, /scan reads message bodies
+intents.members = True          # Privileged: member lookups + headroom for on_member_join raid detection
+# Presence intent intentionally NOT requested: DEIMOS reads no status/activity data.
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
