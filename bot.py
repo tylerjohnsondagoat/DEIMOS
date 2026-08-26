@@ -47,11 +47,14 @@ FORWARD_MODE = "first"
 MAX_FORWARDED_MESSAGES = 20  # Hard cap when FORWARD_MODE = "all" to avoid flooding modchat
 
 # --- Auto-trap: hard-rate carpet-bomb detection -----------------------------
-# A user who posts into TRAP_CHANNELS distinct channels within TRAP_WINDOW_SECONDS
-# is auto-muted + purged (no human can hit 5 different channels in 12s). Counts
-# threads and voice-channel text chats, not just top-level text channels.
+# Two independent sliding windows per user, split by channel kind. Text channels
+# (threads and forum posts ride along here) use the hard-rate test: no human hits
+# 5 different channels in 12s. Voice/stage text chats get their own slower window,
+# where the giveaway is the spread across VC chats, not raw speed.
 TRAP_CHANNELS = 5
 TRAP_WINDOW_SECONDS = 12
+TRAP_VOICE_CHANNELS = 3
+TRAP_VOICE_WINDOW_SECONDS = 300
 # Armed by default. Set DEIMOS_AUTOTRAP_ENABLED=0 in Railway env to disable instantly.
 AUTOTRAP_ENABLED = os.environ.get("DEIMOS_AUTOTRAP_ENABLED", "1").strip().lower() not in (
     "0", "false", "no", "off", "",
@@ -88,8 +91,16 @@ cooldowns: dict[int, datetime] = {}   # user_id -> last kill time
 processed_kills: set[int] = set()     # kill_ids already resolved (dedup)
 
 # Auto-trap state
-spam_windows: dict[int, deque] = {}   # user_id -> deque[(created_at, channel_id)]
+spam_windows: dict[tuple[int, str], deque] = {}   # (user_id, bucket) -> deque[(created_at, channel_id)]
 trapped_users: set[int] = set()       # user_ids already auto-trapped (debounce)
+
+
+def channel_bucket(ch) -> str:
+    """Which auto-trap window a message counts against. Voice and stage text chats
+    are their own bucket; text channels, threads and forum posts share the text one."""
+    if isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+        return "voice"
+    return "text"
 
 
 def iter_message_channels(guild: discord.Guild):
@@ -550,7 +561,8 @@ class TrapReviewView(discord.ui.View):
         self.add_item(TrapUnmuteButton(target_id))
 
 
-async def trap_spammer(guild: discord.Guild, member: discord.Member, channel_ids: set[int]):
+async def trap_spammer(guild: discord.Guild, member: discord.Member, channel_ids: set[int],
+                       window_seconds: int, bucket: str):
     """Auto-mute + purge a carpet-bomber, then post a mod-review report with buttons."""
     target_id = member.id
 
@@ -593,12 +605,17 @@ async def trap_spammer(guild: discord.Guild, member: discord.Member, channel_ids
         return
 
     channel_mentions = " ".join(f"<#{cid}>" for cid in channel_ids)
+    if bucket == "voice":
+        pattern = (f"{len(channel_ids)} voice-channel text chats within "
+                   f"{window_seconds // 60} min")
+    else:
+        pattern = (f"{len(channel_ids)} channels within {window_seconds}s "
+                   f"(faster than any human)")
     report = discord.Embed(
         title="AUTO-TRAP: Carpet-bomb detected",
         description=(
             f"**Target:** {member.mention} (`{target_id}`)\n"
-            f"**Pattern:** {len(channel_ids)} channels within {TRAP_WINDOW_SECONDS}s "
-            f"(faster than any human)\n"
+            f"**Pattern:** {pattern}\n"
             f"**Channels:** {channel_mentions}\n\n"
             f"**Muted:** {'14 days' if muted else 'FAILED (check perms)'}\n"
             f"**Messages purged:** {purged}\n\n"
@@ -668,20 +685,27 @@ async def on_message(message: discord.Message):
         return
 
     uid = author.id
+    bucket = channel_bucket(message.channel)
+    if bucket == "voice":
+        limit, window = TRAP_VOICE_CHANNELS, TRAP_VOICE_WINDOW_SECONDS
+    else:
+        limit, window = TRAP_CHANNELS, TRAP_WINDOW_SECONDS
+
     now = message.created_at  # tz-aware UTC, creation time
-    dq = spam_windows.setdefault(uid, deque())
+    dq = spam_windows.setdefault((uid, bucket), deque())
     dq.append((now, message.channel.id))
 
-    cutoff = now - timedelta(seconds=TRAP_WINDOW_SECONDS)
+    cutoff = now - timedelta(seconds=window)
     while dq and dq[0][0] < cutoff:
         dq.popleft()
 
     distinct = {cid for _, cid in dq}
-    if len(distinct) >= TRAP_CHANNELS:
+    if len(distinct) >= limit:
         trapped_users.add(uid)
-        spam_windows.pop(uid, None)
+        spam_windows.pop((uid, "text"), None)
+        spam_windows.pop((uid, "voice"), None)
         try:
-            await trap_spammer(message.guild, author, distinct)
+            await trap_spammer(message.guild, author, distinct, window, bucket)
         except Exception:
             logger.error("Auto-trap handler failed for %s", uid, exc_info=True)
 
@@ -1072,7 +1096,9 @@ async def pulse_command(interaction: discord.Interaction):
             f"**Pending kills:** {pending}\n"
             f"**Processed (session):** {processed}\n"
             f"**Auto-trap:** {'ARMED' if AUTOTRAP_ENABLED else 'OFF'} "
-            f"({TRAP_CHANNELS} ch / {TRAP_WINDOW_SECONDS}s, {len(trapped_users)} trapped)"
+            f"(text {TRAP_CHANNELS} ch / {TRAP_WINDOW_SECONDS}s, "
+            f"voice {TRAP_VOICE_CHANNELS} ch / {TRAP_VOICE_WINDOW_SECONDS // 60} min, "
+            f"{len(trapped_users)} trapped)"
         ),
         color=discord.Color.green() if db_ok else discord.Color.red(),
         timestamp=discord.utils.utcnow(),
